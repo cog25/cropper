@@ -1408,7 +1408,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 880.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("Cropper — 스캔 PDF 여백 자르기"),
+            .with_title("Cropper"),
         ..Default::default()
     };
     eframe::run_native(
