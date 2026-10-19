@@ -1,0 +1,24 @@
+[package]
+name = "cropper-gui"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Cropper desktop app — scan-PDF margin cropping with krilla + hayro"
+
+[[bin]]
+name = "cropper"
+path = "src/main.rs"
+
+[dependencies]
+cropper-core = { path = "../cropper-core" }
+# default_fonts is dropped on purpose: Pretendard is the only font
+# (embedded natively, fetched at runtime on web). Rest mirrors eframe's defaults.
+eframe = { version = "0.34", default-features = false, features = ["accesskit", "wayland", "web_screen_reader", "wgpu", "x11"] }
+rfd = "0.17"
+unicode-normalization = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Location", "Document", "Element", "HtmlCanvasElement", "Response", "Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement"] }
+js-sys = "0.3"
