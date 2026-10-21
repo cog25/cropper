@@ -21,9 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Nightly + build-std: the web build uses wasm threads (shared memory).
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-unknown-unknown
+          components: rust-src
 
       - uses: Swatinem/rust-cache@v2
 
@@ -36,6 +38,8 @@ jobs:
 
       - name: Build web app
         working-directory: crates/cropper-gui
+        env:
+          CARGO_UNSTABLE_BUILD_STD: std,panic_abort
         run: trunk build --release
 
       # First run only: creates the Pages project; fails harmlessly if it exists.

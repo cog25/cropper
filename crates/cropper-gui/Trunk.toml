@@ -4,3 +4,9 @@ dist = "dist"
 
 [serve]
 port = 8080
+
+# Cross-origin isolation (SharedArrayBuffer for the worker threads); production
+# gets the same headers from the copied `_headers` file (Cloudflare Pages).
+[serve.headers]
+Cross-Origin-Opener-Policy = "same-origin"
+Cross-Origin-Embedder-Policy = "require-corp"

@@ -2,6 +2,7 @@
 //! Used by both the desktop GUI and the wasm bindings.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use hayro::hayro_syntax::Pdf;
 
@@ -12,7 +13,7 @@ use crate::types::{CropRect, DetectOptions};
 /// One open PDF document with cached page rasters.
 pub struct Session {
     source: Vec<u8>,
-    pdf: Pdf,
+    pdf: Arc<Pdf>,
     dims: Vec<(f32, f32)>,
     /// (max_px, raster) per page index, so threshold changes re-detect
     /// without re-rendering.
@@ -21,7 +22,9 @@ pub struct Session {
 
 impl Session {
     pub fn new(source: Vec<u8>) -> Result<Self, String> {
-        let pdf = Pdf::new(source.clone()).map_err(|_| "PDF 파일을 해석할 수 없습니다".to_string())?;
+        let pdf = Arc::new(
+            Pdf::new(source.clone()).map_err(|_| "PDF 파일을 해석할 수 없습니다".to_string())?,
+        );
         let dims = pdf.pages().iter().map(|p| p.render_dimensions()).collect();
         Ok(Self { source, pdf, dims, rasters: HashMap::new() })
     }
@@ -36,6 +39,18 @@ impl Session {
             .get(index)
             .copied()
             .ok_or_else(|| format!("페이지 번호가 범위를 벗어났습니다: {index}"))
+    }
+
+    /// Shared handle to the parsed document, so worker threads can render
+    /// pages in parallel (see [`render_page`]).
+    pub fn pdf(&self) -> Arc<Pdf> {
+        Arc::clone(&self.pdf)
+    }
+
+    /// Store a raster rendered elsewhere (worker thread) so `analyze` finds
+    /// it cached.
+    pub fn insert_raster(&mut self, index: usize, max_px: u32, raster: PageRaster) {
+        self.rasters.insert(index, (max_px, raster));
     }
 
     /// Analyze one page, rendering it first when needed (at `max_px` long
@@ -87,4 +102,17 @@ impl Session {
     pub fn export(&self, placements: &[Option<crate::types::PlacedCrop>]) -> Result<Vec<u8>, String> {
         crate::export::export_cropped(&self.source, placements)
     }
+}
+
+/// Render one page of `pdf` without a `Session`; `Send`-friendly so it can
+/// run on a worker thread.
+pub fn render_page(pdf: &Pdf, index: usize, max_px: u32) -> Option<PageRaster> {
+    pdf.pages().get(index).map(|page| PageRaster::render(page, max_px))
+}
+
+#[allow(dead_code)]
+fn _assert_send_sync() {
+    fn f<T: Send + Sync>() {}
+    f::<Pdf>();
+    f::<PageRaster>();
 }

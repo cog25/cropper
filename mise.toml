@@ -1,0 +1,4 @@
+# Nightly is required for the web build's wasm threads (build-std + atomics).
+[tools]
+rust = { version = "nightly", components = "rust-src", targets = "wasm32-unknown-unknown" }
+trunk = "latest"
