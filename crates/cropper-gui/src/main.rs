@@ -82,12 +82,14 @@ fn spawn_job(job: impl FnOnce() + Send + 'static) {
 
 /// How many pages render concurrently.
 fn scan_workers() -> usize {
-    #[cfg(not(target_arch = "wasm32"))]
-    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    // Scans with huge image masks peak at 0.5-0.7 GiB per page render, and
+    // wasm memory never shrinks, so the web build stays at two workers (the
+    // heap high-water mark scales with concurrency).
     #[cfg(target_arch = "wasm32")]
-    let cores = web_sys::window().map_or(2, |w| w.navigator().hardware_concurrency() as usize);
-    // Leave one core for the UI; cap so rasters in flight stay small.
-    cores.saturating_sub(1).clamp(1, 8)
+    return 2;
+    // Native: leave one core for the UI.
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 8)
 }
 
 /// A page rendered by a worker, tagged with the load it belongs to.
@@ -413,11 +415,17 @@ impl App {
         let mut free = workers.saturating_sub(in_flight);
         while free > 0 && self.scan_dispatched < total.min(window) {
             let (pdf, index, generation) = (session.pdf(), self.scan_dispatched, self.scan_generation);
-            let (tx, ctx) = (self.scan_tx.clone(), ui.ctx().clone());
+            let tx = self.scan_tx.clone();
+            // Workers must not touch egui on the web: eframe looks up
+            // `window()` (absent in a worker) and parking_lot cannot park.
+            // The 30 ms repaint poll while scanning picks results up instead.
+            #[cfg(not(target_arch = "wasm32"))]
+            let ctx = ui.ctx().clone();
             spawn_job(move || {
                 let raster = cropper_core::session::render_page(&pdf, index, MAX_PX)
                     .ok_or_else(|| format!("페이지 번호가 범위를 벗어났습니다: {index}"));
                 let _ = tx.send(Scanned { generation, index, raster });
+                #[cfg(not(target_arch = "wasm32"))]
                 ctx.request_repaint();
             });
             self.scan_dispatched += 1;
@@ -1498,7 +1506,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 880.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("Cropper"),
+            .with_title("Cropper — 스캔 PDF 여백 자르기"),
         ..Default::default()
     };
     eframe::run_native(

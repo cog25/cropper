@@ -1,10 +1,11 @@
 # Web build only: wasm threads (tokio_with_wasm::spawn_blocking) need shared
-# memory. Build with ./build-web.sh, which adds nightly + build-std.
+# memory (4 GiB cap: scans with huge image masks peak at ~0.5-0.7 GiB per
+# page render). Build with ./build-web.sh, which adds nightly + build-std.
 [target.wasm32-unknown-unknown]
 rustflags = [
   "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
   "-C", "link-arg=--shared-memory",
-  "-C", "link-arg=--max-memory=1073741824",
+  "-C", "link-arg=--max-memory=4294967296",
   "-C", "link-arg=--import-memory",
   "-C", "link-arg=--export=__wasm_init_tls",
   "-C", "link-arg=--export=__tls_size",
