@@ -19,6 +19,7 @@ unicode-normalization = "0.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
+tokio_with_wasm = { version = "0.9", features = ["rt"] }
 console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["Window", "Navigator", "Location", "Document", "Element", "HtmlCanvasElement", "Response", "Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement"] }
 js-sys = "0.3"

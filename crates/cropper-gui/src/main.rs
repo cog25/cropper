@@ -67,6 +67,37 @@ struct Settings {
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+/// Run `job` on a background thread: a std thread natively, a pooled web
+/// worker (tokio_with_wasm, needs the atomics build) on the web.
+fn spawn_job(job: impl FnOnce() + Send + 'static) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::spawn(job);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        drop(tokio_with_wasm::task::spawn_blocking(job));
+    }
+}
+
+/// How many pages render concurrently.
+fn scan_workers() -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    #[cfg(target_arch = "wasm32")]
+    let cores = web_sys::window().map_or(2, |w| w.navigator().hardware_concurrency() as usize);
+    // Leave one core for the UI; cap so rasters in flight stay small.
+    cores.saturating_sub(1).clamp(1, 8)
+}
+
+/// A page rendered by a worker, tagged with the load it belongs to.
+struct Scanned {
+    generation: u64,
+    index: usize,
+    raster: Result<cropper_core::render::PageRaster, String>,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 enum Inbox {
     Opened(String, Vec<u8>),
 }
@@ -113,12 +144,27 @@ struct App {
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     inbox_tx: std::sync::mpsc::Sender<Inbox>,
     inbox_rx: std::sync::mpsc::Receiver<Inbox>,
+    /// Parallel page rendering: workers send finished rasters here.
+    scan_tx: std::sync::mpsc::Sender<Scanned>,
+    scan_rx: std::sync::mpsc::Receiver<Scanned>,
+    /// Bumped on every load so late results of a previous file are dropped.
+    scan_generation: u64,
+    /// Next page index to hand to a worker.
+    scan_dispatched: usize,
+    /// Rasters that finished ahead of `scanned` (completion is out of order).
+    scan_ready: std::collections::HashMap<usize, cropper_core::render::PageRaster>,
 }
 
 impl App {
     fn new() -> Self {
         let (inbox_tx, inbox_rx) = std::sync::mpsc::channel();
+        let (scan_tx, scan_rx) = std::sync::mpsc::channel();
         Self {
+            scan_tx,
+            scan_rx,
+            scan_generation: 0,
+            scan_dispatched: 0,
+            scan_ready: std::collections::HashMap::new(),
             session: None,
             file_name: String::new(),
             pages: Vec::new(),
@@ -230,6 +276,9 @@ impl App {
                 self.session = Some(session);
                 self.file_name = name;
                 self.scanned = 0;
+                self.scan_generation += 1;
+                self.scan_dispatched = 0;
+                self.scan_ready.clear();
                 self.applied = None;
                 self.selected = 0;
                 self.preview_zoom = 1.0;
@@ -329,40 +378,81 @@ impl App {
         }
     }
 
-    /// Render + detect the next unscanned page, one per frame, so the
-    /// window keeps responding and shows sequential progress.
+    /// Keep `scan_workers()` page renders in flight on background threads,
+    /// then consume finished pages in order (detection is cheap; rendering is
+    /// the cost). 70-page scans render in parallel instead of one per frame.
     fn scan_next(&mut self, ui: &mut egui::Ui) {
         let Some(session) = &mut self.session else { return };
         let total = session.page_count();
         if self.scanned >= total {
             return;
         }
-        let index = self.scanned;
+
+        // Collect finished renders.
+        while let Ok(done) = self.scan_rx.try_recv() {
+            if done.generation != self.scan_generation {
+                continue;
+            }
+            match done.raster {
+                Ok(raster) => {
+                    self.scan_ready.insert(done.index, raster);
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    self.scanned = total;
+                    return;
+                }
+            }
+        }
+
+        // Top up the workers, bounding how far dispatch runs ahead of the
+        // consumed prefix so buffered rasters stay few.
+        let workers = scan_workers();
+        let window = self.scanned + workers * 2;
+        let in_flight = self.scan_dispatched - self.scanned - self.scan_ready.len();
+        let mut free = workers.saturating_sub(in_flight);
+        while free > 0 && self.scan_dispatched < total.min(window) {
+            let (pdf, index, generation) = (session.pdf(), self.scan_dispatched, self.scan_generation);
+            let (tx, ctx) = (self.scan_tx.clone(), ui.ctx().clone());
+            spawn_job(move || {
+                let raster = cropper_core::session::render_page(&pdf, index, MAX_PX)
+                    .ok_or_else(|| format!("페이지 번호가 범위를 벗어났습니다: {index}"));
+                let _ = tx.send(Scanned { generation, index, raster });
+                ctx.request_repaint();
+            });
+            self.scan_dispatched += 1;
+            free -= 1;
+        }
+
+        // Consume the contiguous finished prefix.
         let options =
             DetectOptions { threshold: self.settings.threshold, min_ink: self.settings.min_ink, edge_mm: self.settings.edge_mm };
-        if let Err(e) = session.analyze(index, MAX_PX, &options) {
-            self.error = Some(e);
-            self.scanned = total;
-            return;
+        let mut consumed = 0;
+        while consumed < 4 {
+            let index = self.scanned;
+            let Some(raster) = self.scan_ready.remove(&index) else { break };
+            session.insert_raster(index, MAX_PX, raster);
+            let texture = make_texture(ui.ctx(), index, session.raster(index).unwrap());
+            let fallback = CropRect::new(0.0, 0.0, 1.0, 1.0);
+            let (crop, ratio, blank, _) =
+                session.analyze(index, MAX_PX, &options).unwrap_or((fallback, 0.0, true, 1));
+            let (page_width, page_height) = session.page_size(index).unwrap_or_default();
+            let page = &mut self.pages[index];
+            page.analysis = Some(PageAnalysis { page_width, page_height, crop, ink_ratio: ratio, blank });
+            page.texture = Some(texture);
+            self.scanned += 1;
+            consumed += 1;
+            if self.scanned == total {
+                break;
+            }
         }
-        // analyze() above rendered + cached the raster.
-        let raster = match session.raster(index) {
-            Some(r) => r,
-            None => return,
-        };
-        let texture = make_texture(ui.ctx(), index, raster);
-        let fallback = CropRect::new(0.0, 0.0, 1.0, 1.0);
-        let (crop, ratio, blank, _) =
-            session.analyze(index, MAX_PX, &options).unwrap_or((fallback, 0.0, true, 1));
-        let (page_width, page_height) = session.page_size(index).unwrap_or_default();
-        let analysis = PageAnalysis { page_width, page_height, crop, ink_ratio: ratio, blank };
+        if consumed > 0 && self.scanned == total {
+            self.finish_scan(total);
+        }
+    }
 
-        let page = &mut self.pages[index];
-        page.analysis = Some(analysis);
-        page.texture = Some(texture);
-
-        self.scanned += 1;
-        if self.scanned == total {
+    fn finish_scan(&mut self, total: usize) {
+        {
             self.applied = Some(Settings {
                 threshold: self.settings.threshold,
                 pad_mm: self.settings.pad_mm,
