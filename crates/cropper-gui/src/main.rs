@@ -80,16 +80,43 @@ fn spawn_job(job: impl FnOnce() + Send + 'static) {
     }
 }
 
-/// How many pages render concurrently.
-fn scan_workers() -> usize {
-    // Scans with huge image masks peak at 0.5-0.7 GiB per page render, and
-    // wasm memory never shrinks, so the web build stays at two workers (the
-    // heap high-water mark scales with concurrency).
+/// Current wasm linear-memory size in bytes (the heap high-water mark: wasm
+/// memory never shrinks). Always 0 natively.
+fn heap_bytes() -> usize {
     #[cfg(target_arch = "wasm32")]
-    return 2;
+    return core::arch::wasm32::memory_size(0) * 65536;
+    #[cfg(not(target_arch = "wasm32"))]
+    0
+}
+
+/// How many pages may render concurrently.
+///
+/// Web: rendering heavy scans peaks at ~0.5-0.7 GiB per page and the heap
+/// never shrinks, so concurrency is learned instead of fixed. The first page
+/// runs alone; once pages finish, `render_cost` (heap growth per concurrent
+/// render) decides how many fit in `HEAP_BUDGET`, ramping up one worker at a
+/// time so a bad estimate cannot overshoot far.
+fn scan_workers(heap_base: usize, render_cost: usize, peak_flight: usize) -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // 4 GiB is the wasm32 ceiling; keep headroom for the UI and fragmentation.
+        const HEAP_BUDGET: usize = 3 << 30;
+        const MIN_COST: usize = 32 << 20;
+        let cores = web_sys::window().map_or(2, |w| w.navigator().hardware_concurrency() as usize);
+        let cap = cores.saturating_sub(1).clamp(1, 8);
+        if render_cost == 0 {
+            return 1; // nothing finished yet: probe with a single render
+        }
+        let cost = render_cost.max(MIN_COST) / 4 * 5;
+        let room = HEAP_BUDGET.saturating_sub(heap_base) / cost;
+        return room.min(peak_flight + 1).clamp(1, cap);
+    }
     // Native: leave one core for the UI.
     #[cfg(not(target_arch = "wasm32"))]
-    std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 8)
+    {
+        let _ = (heap_base, render_cost, peak_flight);
+        std::thread::available_parallelism().map_or(2, |n| n.get()).saturating_sub(1).clamp(1, 8)
+    }
 }
 
 /// A page rendered by a worker, tagged with the load it belongs to.
@@ -155,6 +182,12 @@ struct App {
     scan_dispatched: usize,
     /// Rasters that finished ahead of `scanned` (completion is out of order).
     scan_ready: std::collections::HashMap<usize, cropper_core::render::PageRaster>,
+    /// Wasm heap size when the current scan began, and the most renders seen
+    /// in flight at once; together they give the heap cost per render.
+    heap_base: usize,
+    scan_peak_flight: usize,
+    /// Heap growth per concurrent render seen so far (0 until a page finishes).
+    render_cost: usize,
 }
 
 impl App {
@@ -167,6 +200,9 @@ impl App {
             scan_generation: 0,
             scan_dispatched: 0,
             scan_ready: std::collections::HashMap::new(),
+            heap_base: 0,
+            scan_peak_flight: 0,
+            render_cost: 0,
             session: None,
             file_name: String::new(),
             pages: Vec::new(),
@@ -280,6 +316,9 @@ impl App {
                 self.scanned = 0;
                 self.scan_generation += 1;
                 self.scan_dispatched = 0;
+                self.scan_peak_flight = 0;
+                self.render_cost = 0;
+                self.heap_base = heap_bytes();
                 self.scan_ready.clear();
                 self.applied = None;
                 self.selected = 0;
@@ -398,6 +437,8 @@ impl App {
             match done.raster {
                 Ok(raster) => {
                     self.scan_ready.insert(done.index, raster);
+                    let grown = heap_bytes().saturating_sub(self.heap_base);
+                    self.render_cost = self.render_cost.max(grown / self.scan_peak_flight.max(1));
                 }
                 Err(e) => {
                     self.error = Some(e);
@@ -409,11 +450,11 @@ impl App {
 
         // Top up the workers, bounding how far dispatch runs ahead of the
         // consumed prefix so buffered rasters stay few.
-        let workers = scan_workers();
-        let window = self.scanned + workers * 2;
         let in_flight = self.scan_dispatched - self.scanned - self.scan_ready.len();
-        let mut free = workers.saturating_sub(in_flight);
-        while free > 0 && self.scan_dispatched < total.min(window) {
+        let workers = scan_workers(self.heap_base, self.render_cost, self.scan_peak_flight);
+        let window = self.scanned + workers * 2;
+        let mut flight = in_flight;
+        while flight < workers && self.scan_dispatched < total.min(window) {
             let (pdf, index, generation) = (session.pdf(), self.scan_dispatched, self.scan_generation);
             let tx = self.scan_tx.clone();
             // Workers must not touch egui on the web: eframe looks up
@@ -429,8 +470,9 @@ impl App {
                 ctx.request_repaint();
             });
             self.scan_dispatched += 1;
-            free -= 1;
+            flight += 1;
         }
+        self.scan_peak_flight = self.scan_peak_flight.max(flight);
 
         // Consume the contiguous finished prefix.
         let options =
