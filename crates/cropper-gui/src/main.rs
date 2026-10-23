@@ -1402,7 +1402,8 @@ fn draw_page(
             }
         }
 
-        let response = ui.interact(rect, egui::Id::new(("page", index)), Sense::click());
+        // Scoped to this ui: the sidebar and the overview grid both draw page `index`.
+        let response = ui.interact(rect, ui.id().with(("page", index)), Sense::click());
         if analysis.is_some() {
             hit.clicked = response.clicked();
             hit.double_clicked = response.double_clicked();
